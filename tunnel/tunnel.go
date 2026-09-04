@@ -218,6 +218,19 @@ type ServerConfig struct {
 	RegisterHandler     ServerRegHandlerFunc
 	Handler             ServerHandlerFunc
 	LocalTargets        []Target
+
+	// PrivilegeNewestRegistration changes how a duplicate target-name
+	// registration is resolved. By default (false) a target already registered
+	// by another client is rejected — correct when target-names are globally
+	// unique, but it wedges recovery if the previous client's Register stream is
+	// a half-open zombie (e.g. a device reloaded and the FIN never arrived): the
+	// stale entry blocks the device from re-registering until the server
+	// restarts. When true, a same-name registration from a different client
+	// evicts the stale owner (transferring ownership and tearing down the old
+	// target's handler state) and accepts the new one, so a reconnecting client
+	// always wins. Target teardown is made owner-aware, so the evicted client's
+	// later cleanup cannot clobber the new registration.
+	PrivilegeNewestRegistration bool
 }
 
 func (s *Server) bridgeRegHandler(ss ServerSession) error {
@@ -414,45 +427,134 @@ func errorTargetRegisterOp(id, typ, err string) *tpb.RegisterOp {
 	return &tpb.RegisterOp{Registration: &tpb.RegisterOp_Target{Target: &tpb.Target{Target: id, TargetType: typ, Error: err}}}
 }
 
-// addTargetToMap adds a target to the targets map.
-func (s *Server) addTargetToMap(addr net.Addr, t Target) error {
+// addTargetToMap adds a target to the targets map. If the target is already
+// owned by a different client and PrivilegeNewestRegistration is set, ownership
+// is transferred to addr and the evicted previous owner is returned so the
+// caller can tear down its stale registration; otherwise a duplicate is
+// rejected as before. evicted is nil for a clean add.
+func (s *Server) addTargetToMap(addr net.Addr, t Target) (evicted net.Addr, evictedHadTarget bool, err error) {
+	// cmu (outer) then tmu (inner) — the same order as addTargetToClient, and no
+	// path takes tmu then cmu, so this is deadlock-free. Holding both lets the
+	// ownership transfer and the removal-of/decision-about the evicted owner's
+	// client-set entry happen atomically, so a stale owner's concurrent cleanup
+	// cannot change whether we run its DeleteTargetHandler.
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	if c, ok := s.rTargets[t]; ok {
-		return fmt.Errorf("target %q already registered for client %q", t.ID, c)
+	c, ok := s.rTargets[t]
+	if !ok {
+		s.rTargets[t] = addr
+		return nil, false, nil
 	}
+	if c == addr || !s.sc.PrivilegeNewestRegistration {
+		return nil, false, fmt.Errorf("target %q already registered for client %q", t.ID, c)
+	}
+	// Privilege the newest registration: take ownership from the stale client,
+	// and atomically remove t from its client set while capturing whether it had
+	// actually recorded t (i.e. completed registration). The caller runs the
+	// stale owner's DeleteTargetHandler based on this captured fact, exactly once,
+	// regardless of the stale owner's own concurrent cleanup.
 	s.rTargets[t] = addr
-	return nil
+	if info, ok := s.clients[c]; ok {
+		if _, ok := info.targets[t]; ok {
+			delete(info.targets, t)
+			evictedHadTarget = true
+		}
+	}
+	return c, evictedHadTarget, nil
 }
 
-// deleteTargetFromMap deletes a target from the targets map.
-func (s *Server) deleteTargetFromMap(t Target) error {
+// deleteTargetFromMap deletes a target from the targets map, but only if it is
+// still owned by addr. It reports whether addr owned the target: ownership can
+// have moved to a newer client (see PrivilegeNewestRegistration), and a stale
+// owner's later cleanup must neither delete the map entry nor tear down the
+// target's handler state, or it would clobber the current registration — so a
+// non-owner delete is a no-op that returns owned=false.
+func (s *Server) deleteTargetFromMap(addr net.Addr, t Target) (owned bool, err error) {
 	s.tmu.Lock()
 	defer s.tmu.Unlock()
 
-	if c, ok := s.rTargets[t]; !ok {
-		return fmt.Errorf("target %q is not registered for client %q", t.ID, c)
+	c, ok := s.rTargets[t]
+	if !ok {
+		return false, fmt.Errorf("target %q is not registered for client %q", t.ID, c)
+	}
+	if c != addr {
+		// Target has been re-homed to a newer client; leave it intact.
+		return false, nil
 	}
 
 	delete(s.rTargets, t)
-	return nil
+	return true, nil
 }
 
 // addTargetToClient adds a target to the clients map.
-func (s *Server) addTargetToClient(addr net.Addr, t Target) {
+// addTargetToClient records t in addr's client set, but only if addr still owns
+// t in rTargets. Holding cmu then tmu makes the ownership check and the record
+// atomic with respect to eviction: a client that clean-added t in rTargets and
+// was then evicted before reaching here must not strand t in its own set. The
+// lock order is cmu -> tmu; no path takes tmu then cmu, so this is deadlock-free.
+// Returns whether it recorded the target.
+func (s *Server) addTargetToClient(addr net.Addr, t Target) bool {
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
-	// Already checked its entry does exists.
+	s.tmu.RLock()
+	owned := s.rTargets[t] == addr
+	s.tmu.RUnlock()
+	if !owned {
+		return false
+	}
+	// The client entry existence was checked by the caller.
 	s.clients[addr].targets[t] = struct{}{}
+	return true
 }
 
-// deleteTargetFromClient deletes a target to the clients map.
-func (s *Server) deleteTargetFromClient(addr net.Addr, t Target) {
+// clientHasTarget reports whether addr's client set contains t, read under cmu.
+// The per-client target set is a shared map; reading it via a clientInfo copy
+// without the lock races with concurrent addTargetToClient/deleteTargetFromClient.
+func (s *Server) clientHasTarget(addr net.Addr, t Target) bool {
+	s.cmu.RLock()
+	defer s.cmu.RUnlock()
+	info, ok := s.clients[addr]
+	if !ok {
+		return false
+	}
+	_, ok = info.targets[t]
+	return ok
+}
+
+// deleteTargetFromClient removes t from addr's client set and reports whether it
+// was actually present (so callers can distinguish a real registration from a
+// provisional owner that was visible in rTargets but never recorded).
+func (s *Server) deleteTargetFromClient(addr net.Addr, t Target) bool {
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
-	// Already checked its entry exists.
-	delete(s.clients[addr].targets, t)
+	info, ok := s.clients[addr]
+	if !ok {
+		return false
+	}
+	if _, ok := info.targets[t]; !ok {
+		return false
+	}
+	delete(info.targets, t)
+	return true
+}
+
+// handleEviction runs the teardown for a stale owner (evicted) that lost target
+// t to addr's registration. It fires DeleteTargetHandler iff the evicted owner
+// had actually recorded t — evictedHad is captured atomically with the ownership
+// transfer by addTargetToMap, so this decision is race-free with respect to the
+// evicted owner's own concurrent cleanup (a provisional owner that claimed t in
+// rTargets but never recorded it has no handler state to tear down). It never
+// touches the evicted client's Register stream (it may be a blocked zombie).
+func (s *Server) handleEviction(addr, evicted net.Addr, evictedHad bool, t Target) {
+	if evictedHad && s.sc.DeleteTargetHandler != nil {
+		if err := s.sc.DeleteTargetHandler(t); err != nil {
+			s.sendError(fmt.Errorf("evicting target %q held by stale client %q: delete handler failed: %v", t.ID, evicted, err))
+		}
+	}
+	s.sendError(fmt.Errorf("target %q re-registered by %q evicted stale registration held by %q", t.ID, addr, evicted))
 }
 
 // addTarget registers a target for a given client. It registers
@@ -482,14 +584,52 @@ func (s *Server) addTarget(addr net.Addr, target *tpb.Target) error {
 		return err
 	}
 
-	if err := s.addTargetToMap(addr, t); err != nil {
+	evicted, evictedHad, err := s.addTargetToMap(addr, t)
+	if err != nil {
 		if err := rs.Send(errorTargetRegisterOp(target.Target, target.TargetType, err.Error())); err != nil {
 			return fmt.Errorf("failed to send session error: %v", err)
 		}
 		return err
 	}
+	if evicted != nil {
+		s.handleEviction(addr, evicted, evictedHad, t)
+	}
 
-	s.addTargetToClient(addr, t)
+	// Record t in addr's client set, but only if addr still owns it. If a newer
+	// registration evicted addr between the addTargetToMap claim above and here,
+	// addTargetToClient returns false and we abandon this registration without
+	// standing anything up — the newest registration wins.
+	if !s.addTargetToClient(addr, t) {
+		return fmt.Errorf("target %q re-homed to a newer registration during setup", t.ID)
+	}
+
+	// Announce the target only on a fresh registration. On an eviction the
+	// target-name stayed continuously present (it only moved tunnels), so a
+	// second ADD with no intervening REMOVE would double-notify subscribers;
+	// suppress it (announce == false).
+	return s.finishAddTarget(addr, rs, target, t, evicted == nil)
+}
+
+// finishAddTarget performs the post-record steps of a registration: a
+// best-effort ownership recheck, then the accept ack, AddTargetHandler, and
+// (when announce is set) the subscriber ADD broadcast. It is split from
+// addTarget so that (a) the eviction-race tests can drive the record and the
+// side effects around a barrier without a production hook, and (b) a client
+// evicted after recording itself but before these side effects does not fire
+// them as a non-owner.
+//
+// The recheck is best-effort: handlers and stream sends run outside the locks,
+// so a residual window remains between the check and the side effect. A hard
+// guarantee would require target-level serialization; best-effort is
+// sufficient for the eviction semantics this option provides, since a caller
+// that keeps owner-aware state can discard a stale side effect.
+func (s *Server) finishAddTarget(addr net.Addr, rs regStream, target *tpb.Target, t Target, announce bool) error {
+	if s.clientFromTarget(t) != addr {
+		// Evicted after we recorded t: undo the record and bail rather than fire
+		// stale side effects for a target we no longer own.
+		s.deleteTargetFromClient(addr, t)
+		return fmt.Errorf("target %q re-homed to a newer registration during setup", t.ID)
+	}
 
 	if err := rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Target{Target: &tpb.Target{
 		Target:     target.Target,
@@ -505,8 +645,10 @@ func (s *Server) addTarget(addr net.Addr, target *tpb.Target) error {
 		}
 	}
 
-	if err := s.sendUpdates(t, true); err != nil {
-		return fmt.Errorf("failed to send target subscription updates: %v", err)
+	if announce {
+		if err := s.sendUpdates(t, true); err != nil {
+			return fmt.Errorf("failed to send target subscription updates: %v", err)
+		}
 	}
 
 	return nil
@@ -703,7 +845,7 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 	rs := clientInfo.rs
 	t := Target{ID: target.Target, Type: target.TargetType}
 
-	if _, ok := clientInfo.targets[t]; !ok {
+	if !s.clientHasTarget(addr, t) {
 		err := fmt.Errorf("target %q is not registered in s.clients", t)
 		if err := rs.Send(errorTargetRegisterOp(target.Target, target.TargetType, err.Error())); err != nil {
 			return fmt.Errorf("failed to send session error: %v", err)
@@ -711,7 +853,12 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 		return err
 	}
 
-	if err := s.deleteTargetFromMap(t); err != nil {
+	owned, err := s.deleteTargetFromMap(addr, t)
+	// Always prune addr's own client-set entry, even when the map reports the
+	// target !ok (re-homed to a newer owner, or already gone). Leaving it
+	// recorded is what lets a stranded entry wedge deleteClient's cleanup.
+	s.deleteTargetFromClient(addr, t)
+	if err != nil {
 		if ack {
 			if err := rs.Send(errorTargetRegisterOp(target.Target, target.TargetType, err.Error())); err != nil {
 				return fmt.Errorf("failed to send session error: %v", err)
@@ -720,7 +867,6 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 		return err
 	}
 
-	s.deleteTargetFromClient(addr, t)
 	if ack {
 		if err := rs.Send(&tpb.RegisterOp{Registration: &tpb.RegisterOp_Target{Target: &tpb.Target{
 			Target:     target.Target,
@@ -731,14 +877,24 @@ func (s *Server) deleteTarget(addr net.Addr, target *tpb.Target, ack bool) error
 		}
 	}
 
-	if s.sc.DeleteTargetHandler != nil {
+	// Tear down the target-global state (delete handler, subscriber updates)
+	// only if this client still owned the target. If ownership was re-homed to a
+	// newer client (PrivilegeNewestRegistration), the new owner is responsible
+	// for t — running the handler here would clobber its session. The client's
+	// own bookkeeping (target set, subscriber entry) is always cleaned up.
+	if owned && s.sc.DeleteTargetHandler != nil {
 		if err := s.sc.DeleteTargetHandler(t); err != nil {
 			return fmt.Errorf("error calling target deletion handler client: %v", err)
 		}
 	}
-	s.deleteSubscriber(addr, "")
-	if err := s.sendUpdates(t, false); err != nil {
-		return fmt.Errorf("failed to send target subscription updates: %v", err)
+	// Subscription cleanup is NOT done here: a subscriber that unregisters one
+	// target should keep its subscription, and an evicted client's targets are
+	// gone before it disconnects. Per-client subscriber state is cleared in
+	// deleteClient, the correct ownership boundary.
+	if owned {
+		if err := s.sendUpdates(t, false); err != nil {
+			return fmt.Errorf("failed to send target subscription updates: %v", err)
+		}
 	}
 
 	return nil
@@ -815,11 +971,11 @@ func (s *Server) Register(stream tpb.Tunnel_RegisterServer) error {
 			s.newClientSession(ctx, reg.GetSession(), p.Addr, rs)
 		case *tpb.RegisterOp_Target:
 			if err := s.handleTarget(p.Addr, reg.GetTarget()); err != nil {
-				s.sendError(fmt.Errorf("failed to handle target registration: %v", err))
+				s.sendError(fmt.Errorf("client %s: failed to handle target registration: %v", p.Addr, err))
 			}
 		case *tpb.RegisterOp_Subscription:
 			if err := s.handleSubscription(p.Addr, reg.GetSubscription()); err != nil {
-				s.sendError(fmt.Errorf("failed to handle subscription registration: %v", err))
+				s.sendError(fmt.Errorf("client %s: failed to handle subscription registration: %v", p.Addr, err))
 			}
 		default:
 			s.sendError(fmt.Errorf("unknown registration op from %s: %s", p.Addr, reg.Registration))
