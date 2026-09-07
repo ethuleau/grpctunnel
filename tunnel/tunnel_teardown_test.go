@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc/peer"
+
+	tpb "github.com/openconfig/grpctunnel/proto/tunnel"
 )
 
 // Regression tests for teardown paths that only misbehave under contention or
@@ -88,5 +90,43 @@ func TestClientStartSpuriousCallKeepsRunningInstance(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("running instance did not stop on context cancellation")
+	}
+}
+
+// deleteClient held cmu while calling deleteTarget, which re-takes cmu through
+// clientInfo. RWMutex is not reentrant, so a client torn down with a target
+// still recorded deadlocked and wedged cmu server-wide. Normal teardown runs
+// deleteTargets first, which is why the set is usually empty by then.
+func TestDeleteClientWithRecordedTargetDoesNotDeadlock(t *testing.T) {
+	s, err := NewServer(ServerConfig{})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	addr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45001}
+	if err := s.addClient(addr, &registerTestStream{maxSends: 10, ctx: context.Background()}); err != nil {
+		t.Fatalf("addClient: %v", err)
+	}
+	// Register the target through the normal path, then tear the client down
+	// without the deleteTargets pass that Register's defers run first.
+	target := Target{ID: "target1", Type: "GNMI_GNOI"}
+	if err := s.addTarget(addr, &tpb.Target{Target: target.ID, TargetType: target.Type, Op: tpb.Target_ADD}); err != nil {
+		t.Fatalf("addTarget: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.deleteClient(addr)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deleteClient deadlocked with a target still recorded for the client")
+	}
+	if got := s.clientFromTarget(target); got != nil {
+		t.Errorf("target still registered to %v after deleteClient", got)
+	}
+	if info := s.clientInfo(addr); !info.IsZero() {
+		t.Error("client still registered after deleteClient")
 	}
 }

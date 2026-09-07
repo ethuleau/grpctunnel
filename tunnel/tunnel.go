@@ -370,19 +370,32 @@ func (s *Server) addClient(addr net.Addr, rs regStream) error {
 
 // deleteClient removes a client from the clients map, and delete the corresponding targets from the targets map.
 func (s *Server) deleteClient(addr net.Addr) {
+	// Snapshot the remaining targets under cmu, then release it before calling
+	// deleteTarget: deleteTarget re-locks cmu (via clientInfo), and RWMutex is
+	// not reentrant, so holding cmu across the call self-deadlocks and wedges
+	// cmu server-wide. In normal operation deleteTargets has already emptied
+	// the set, so this loop is usually a no-op; it is a backstop for any target
+	// still recorded here.
 	s.cmu.Lock()
-	defer s.cmu.Unlock()
 	clientInfo, ok := s.clients[addr]
 	if !ok {
+		s.cmu.Unlock()
 		return
 	}
-
+	remaining := make([]Target, 0, len(clientInfo.targets))
 	for t := range clientInfo.targets {
+		remaining = append(remaining, t)
+	}
+	s.cmu.Unlock()
+
+	for _, t := range remaining {
 		target := tpb.Target{Target: t.ID, TargetType: t.Type}
 		s.deleteTarget(addr, &target, false)
 	}
 
+	s.cmu.Lock()
 	delete(s.clients, addr)
+	s.cmu.Unlock()
 }
 
 // errorTargetRegisterOp returns a RegisterOp message of the form Registration with error.
