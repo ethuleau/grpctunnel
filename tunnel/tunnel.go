@@ -401,6 +401,12 @@ func (s *Server) deleteClient(addr net.Addr) {
 	s.cmu.Lock()
 	delete(s.clients, addr)
 	s.cmu.Unlock()
+
+	// Subscription state is per-client, so it is cleaned up on client teardown.
+	// deleteTarget also clears it, but only runs for a client that registered a
+	// target; a client that only subscribed never reached it and leaked its
+	// entry on every disconnect.
+	s.deleteSubscriber(addr, "")
 }
 
 // errorTargetRegisterOp returns a RegisterOp message of the form Registration with error.

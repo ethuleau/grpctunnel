@@ -168,3 +168,29 @@ func TestClientTargetsNilDoesNotRaceWithTargetMap(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// A client's subscription entry was only cleared inside deleteTarget, so a
+// client that subscribed without registering any target leaked it on every
+// disconnect.
+func TestDeleteClientClearsSubscriptionOfTargetlessClient(t *testing.T) {
+	s, err := NewServer(ServerConfig{})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	addr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45003}
+	if err := s.addClient(addr, &registerTestStream{maxSends: 10, ctx: context.Background()}); err != nil {
+		t.Fatalf("addClient: %v", err)
+	}
+	if err := s.addSubscription(addr, "GNMI_GNOI"); err != nil {
+		t.Fatalf("addSubscription: %v", err)
+	}
+
+	s.deleteClient(addr)
+
+	s.smu.RLock()
+	_, leaked := s.sub[addr]
+	s.smu.RUnlock()
+	if leaked {
+		t.Fatal("subscription entry survived client teardown")
+	}
+}
