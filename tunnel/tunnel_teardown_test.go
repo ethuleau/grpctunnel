@@ -16,7 +16,9 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,4 +131,40 @@ func TestDeleteClientWithRecordedTargetDoesNotDeadlock(t *testing.T) {
 	if info := s.clientInfo(addr); !info.IsZero() {
 		t.Error("client still registered after deleteClient")
 	}
+}
+
+// clientTargets(nil) read rTargets under cmu while every writer holds tmu.
+// Only the race detector sees this: run with -race.
+func TestClientTargetsNilDoesNotRaceWithTargetMap(t *testing.T) {
+	s, err := NewServer(ServerConfig{})
+	if err != nil {
+		t.Fatalf("failed to create server: %v", err)
+	}
+	addr := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 45002}
+	if err := s.addClient(addr, &registerTestStream{maxSends: 1 << 30, ctx: context.Background()}); err != nil {
+		t.Fatalf("addClient: %v", err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			target := &tpb.Target{Target: fmt.Sprintf("target%d", i%8), TargetType: "GNMI_GNOI", Op: tpb.Target_ADD}
+			if err := s.addTarget(addr, target); err == nil {
+				_ = s.deleteTarget(addr, target, false)
+			}
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		s.clientTargets(nil)
+	}
+	close(stop)
+	wg.Wait()
 }
